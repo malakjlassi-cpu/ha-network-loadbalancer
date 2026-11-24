@@ -111,14 +111,3 @@ Les composants seront déployés dans un environnement conteneurisé afin de fac
 - Mesures de performance et visualisations.
 - Documentation technique et contribution au rapport final.
 
-## Périmètre et intégration
-
-Ce module couvre exclusivement l'équilibrage de charge et la surveillance des serveurs backend.
-
-La redondance du répartiteur de charge, notamment la gestion de l'adresse IP virtuelle et le mécanisme de basculement entre plusieurs instances HAProxy, est traitée dans le module dédié à la haute disponibilité du load balancer.
-
-L'intégration finale s'effectuera conformément à l'architecture réseau et aux interfaces définies collectivement par l'équipe.
-
----
-
-*Ce module fait partie du projet High Availability Network Load Balancer.*

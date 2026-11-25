@@ -1,0 +1,271 @@
+## 1. Objectif de la partie
+
+La partie B consiste à mettre en place un répartiteur de charge (**HAProxy**) devant trois serveurs Web Nginx exécutés dans des conteneurs Docker.
+
+Les objectifs travaillés sont :
+- configurer HAProxy comme point d'entrée HTTP ;
+- vérifier la disponibilité des serveurs avec des contrôles de santé ;
+- tester différentes stratégies de répartition ;
+- observer les serveurs choisis grâce aux réponses HTTP et aux journaux HAProxy.
+
+## 2. Environnement mis en place
+
+Environnement utilisé :
+- Ubuntu 24.04 dans VirtualBox ;
+- Docker et Docker Compose ;
+- HAProxy (`haproxy:alpine`) ;
+- trois serveurs Nginx (`nginx:alpine`) ;
+- `curl` pour envoyer les requêtes ;
+- `wrk` installé pour les essais de charge ;
+- Wireshark installé pour les futures observations réseau.
+
+Le réseau Docker utilisé est `docker_lb-network`, avec le sous-réseau `172.18.0.0/16`.
+
+Adresses relevées lors de l'inspection du réseau :
+
+| Conteneur / élément | Adresse IP |
+|---|---|
+| Passerelle Docker | `172.18.0.1` |
+| WEB3 | `172.18.0.2` |
+| WEB1 | `172.18.0.3` |
+| WEB2 | `172.18.0.4` |
+| HAProxy | `172.18.0.5` |
+
+Les trois serveurs Nginx affichent chacun une page d'accueil distincte :
+- WEB1 : `Bienvenue sur WEB1`
+- WEB2 : `Bienvenue sur WEB2`
+- WEB3 : `Bienvenue sur WEB3`
+
+Un endpoint de santé `/health/` a été préparé sur chaque serveur. Il renvoie `200 OK`, ce qui permet à HAProxy de vérifier que le serveur est disponible.
+
+## 3. Configuration de base de HAProxy
+
+La configuration comporte :
+- une section `global` pour les paramètres généraux et les logs ;
+- une section `defaults` en mode HTTP avec les délais d'attente ;
+- un frontend `http_front` qui écoute sur le port `8080` ;
+- un backend `web_servers` qui contient les trois serveurs Nginx.
+
+Les contrôles de santé utilisés dans le backend sont :
+
+```haproxy
+option httpchk GET /health/
+http-check expect status 200
+default-server inter 2s fall 3 rise 2
+```
+
+Interprétation :
+- HAProxy demande régulièrement `/health/` ;
+- une réponse HTTP 200 indique que le serveur est sain ;
+- `inter 2s` définit l'intervalle entre les contrôles ;
+- `fall 3` signifie que trois contrôles échoués consécutifs sont nécessaires pour déclarer le serveur indisponible ;
+- `rise 2` signifie que deux contrôles réussis consécutifs sont nécessaires pour le déclarer de nouveau disponible.
+
+Les trois serveurs sont déclarés dans le backend sous les noms `web1`, `web2` et `web3`.
+
+## 4. Vérifications initiales et tests réalisés
+
+### 4.1 Vérification des conteneurs et des endpoints de santé
+
+Les quatre conteneurs (HAProxy, WEB1, WEB2 et WEB3) ont été démarrés et vérifiés avec `docker ps`.
+
+L'endpoint `/health/` a été testé directement sur les trois serveurs. Les trois ont répondu `OK`.
+
+L'accès à HAProxy a également été testé avec :
+
+```bash
+curl -i http://localhost:8080/
+```
+
+La réponse HTTP `200` et la page d'un serveur Nginx ont confirmé que le frontend et le backend communiquaient correctement.
+
+### 4.2 Test Round Robin
+
+Avec la stratégie Round Robin, plusieurs requêtes successives ont été envoyées à HAProxy. Lors d'un premier test de neuf requêtes, la distribution observée était :
+
+| Serveur | Requêtes |
+|---|---:|
+| WEB1 | 3 |
+| WEB2 | 3 |
+| WEB3 | 3 |
+
+Ce résultat illustre la distribution cyclique entre les trois serveurs.
+
+### 4.3 Test de disponibilité d'un serveur
+
+Le conteneur WEB2 a été arrêté temporairement avec `docker stop web2`. Après le délai nécessaire aux contrôles de santé, les requêtes ont été servies par WEB1 et WEB3.
+
+WEB2 a ensuite été redémarré avec `docker start web2` et sa disponibilité a été vérifiée de nouveau.
+
+Ce test illustre le retrait d'un serveur indisponible de la répartition, puis sa réintégration après son retour en fonctionnement.
+
+### 4.4 Test de charge avec `wrk`
+
+Un test de charge a été réalisé avec :
+
+```bash
+wrk -t2 -c30 -d20s http://localhost:8080/
+```
+
+Résultat observé :
+
+```text
+2 threads and 30 connections
+22458 requests in 20.07s
+Requests/sec: 1119.16
+Latency Avg: 32.08ms
+```
+
+Ce test donne une mesure du débit et de la latence dans l'environnement utilisé. Il ne suffit pas, à lui seul, à prouver qu'une stratégie précise est meilleure qu'une autre.
+
+### 4.5 Essai avec un serveur lent et Least Connections
+
+Pour illustrer le comportement de `leastconn`, un fichier `slow.bin` de 100 Kio a été créé sur les trois serveurs. Une configuration Nginx a limité le débit de téléchargement de ce fichier sur WEB1 à environ 10 Kio/s.
+
+Un téléchargement direct depuis WEB1 a duré environ 9,27 secondes. Des téléchargements simultanés ont ensuite été lancés via HAProxy. Pendant que des téléchargements vers WEB1 étaient encore en cours, des requêtes supplémentaires ont été observées sur WEB2 et WEB3.
+
+Ce résultat est cohérent avec l'objectif de Least Connections : privilégier le serveur ayant le moins de connexions actives. Il s'agit d'une démonstration fonctionnelle, pas d'une comparaison exhaustive de performances entre algorithmes.
+
+## 5. Organisation des fichiers de stratégies
+
+Les configurations des stratégies ont été placées dans `haproxy/strategies/` :
+
+```text
+haproxy/
+├── haproxy.cfg
+├── leastconn-backup.cfg
+├── source-backup.cfg
+└── strategies/
+    ├── leastconn.cfg
+    ├── source.cfg
+    └── weighted.cfg
+```
+
+Les sauvegardes `leastconn-backup.cfg` et `source-backup.cfg` ont été créées au cours des changements temporaires de stratégie. Les fichiers de stratégies permettent de conserver séparément les différentes configurations.
+
+## 6. Stratégie Least Connections
+
+La configuration Least Connections utilise :
+
+```haproxy
+balance leastconn
+```
+
+Des requêtes successives ont été envoyées et les trois serveurs ont répondu. Un essai de charge avec `wrk` a également été réalisé.
+
+Le test avec `slow.bin` a servi à rendre WEB1 plus lent et à observer le comportement du répartiteur pendant que des téléchargements étaient actifs.
+
+À retenir : une simple série de requêtes très rapides ne permet pas nécessairement de distinguer Least Connections de Round Robin. Le test avec des connexions longues est plus adapté pour illustrer cette stratégie.
+
+## 7. Stratégie Source
+
+La configuration Source utilise :
+
+```haproxy
+balance source
+```
+
+Cette stratégie se base sur l'adresse IP source du client pour choisir le serveur. Avec une même IP cliente et une liste de serveurs inchangée, les requêtes sont normalement dirigées vers le même serveur.
+
+### 7.1 Test depuis la machine hôte
+
+Douze requêtes ont été envoyées depuis la machine hôte vers `http://localhost:8080/`.
+
+Résultat : les 12 réponses provenaient de WEB3. Les journaux HAProxy ont confirmé le choix de `web_servers/web3` pour ces requêtes.
+
+Dans ce cas, HAProxy voyait la machine hôte avec l'adresse `172.18.0.1`.
+
+### 7.2 Test avec trois clients Docker
+
+Trois conteneurs clients ont ensuite été créés sur le réseau `docker_lb-network` avec des adresses IP fixes :
+
+| Client | Adresse IP |
+|---|---|
+| client1 | `172.18.0.10` |
+| client2 | `172.18.0.11` |
+| client3 | `172.18.0.12` |
+
+Chaque client a envoyé cinq requêtes à `http://haproxy:8080/`.
+
+Résultats observés :
+
+| Client | Adresse IP | Serveur sélectionné | Nombre de requêtes |
+|---|---|---|---:|
+| client1 | `172.18.0.10` | WEB3 | 5 |
+| client2 | `172.18.0.11` | WEB1 | 5 |
+| client3 | `172.18.0.12` | WEB2 | 5 |
+
+Les journaux HAProxy ont confirmé les associations entre les adresses IP et les serveurs, avec un code HTTP `200` pour les 15 requêtes.
+
+Ces résultats montrent que chaque client a conservé le même serveur pour ses requêtes. Ils ne signifient pas que Source garantit une répartition égale entre les serveurs : plusieurs IP différentes peuvent être associées au même serveur.
+
+## 8. Stratégie Weighted Round Robin
+
+La configuration Weighted Round Robin utilise `balance roundrobin` avec des poids différents :
+
+```haproxy
+balance roundrobin
+
+server web1 web1:80 check weight 3
+server web2 web2:80 check weight 2
+server web3 web3:80 check weight 1
+```
+
+Les poids configurés sont donc dans le rapport `3:2:1`.
+
+La répartition théorique est :
+- WEB1 : 3/6, soit 50 % ;
+- WEB2 : 2/6, soit environ 33,33 % ;
+- WEB3 : 1/6, soit environ 16,67 %.
+
+Après validation de la syntaxe et activation de cette configuration, 60 requêtes ont été envoyées à HAProxy.
+
+Résultat obtenu :
+
+```text
+30 WEB1
+20 WEB2
+10 WEB3
+```
+
+| Serveur | Poids | Requêtes reçues | Pourcentage |
+|---|---:|---:|---:|
+| WEB1 | 3 | 30 | 50 % |
+| WEB2 | 2 | 20 | 33,33 % |
+| WEB3 | 1 | 10 | 16,67 % |
+| **Total** | **6** | **60** | **100 %** |
+
+La distribution observée correspond exactement aux proportions attendues pour ce test.
+
+Les poids ont été définis manuellement dans HAProxy. Ils représentent une capacité relative configurée et ne sont pas automatiquement ajustés en fonction de l'utilisation réelle du CPU.
+
+## 9. Synthèse des stratégies testées
+
+| Stratégie | Principe | Vérification effectuée |
+|---|---|---|
+| Round Robin | Distribue les requêtes successivement entre les serveurs | 9 requêtes : 3 par serveur |
+| Least Connections | Privilégie le serveur ayant le moins de connexions actives | Essais de requêtes, de charge et de téléchargements lents |
+| Source | Utilise l'adresse IP source pour sélectionner le serveur | 12 requêtes depuis l'hôte, puis 5 requêtes depuis chacun des 3 clients |
+| Weighted Round Robin | Distribue selon les poids configurés | 60 requêtes : 30 WEB1, 20 WEB2, 10 WEB3 |
+
+## 10. État d'avancement et éléments à poursuivre
+
+Les éléments suivants ont été réalisés :
+- création de l'environnement Docker avec HAProxy et trois serveurs Nginx ;
+- configuration des pages d'accueil et des endpoints de santé ;
+- configuration et vérification de plusieurs stratégies de répartition ;
+- test d'indisponibilité et de retour d'un serveur ;
+- test de charge avec `wrk` ;
+- test de comportement Least Connections avec des téléchargements lents ;
+- test Source avec plusieurs adresses IP clientes ;
+- test Weighted Round Robin avec des poids `3:2:1`.
+
+Éléments à vérifier ou compléter selon le périmètre final demandé par l'enseignant :
+- centraliser et organiser les captures d'écran dans `captures/` ;
+- préparer une comparaison expérimentale homogène entre les stratégies, avec les mêmes paramètres de test ;
+- produire le tableau et le graphique comparatifs demandés ;
+- terminer les captures et l'analyse Wireshark du trafic HTTP et des contrôles de santé ;
+- vérifier les autres éléments de configuration demandés dans le sujet (par exemple statistiques protégées, socket d'administration, fichier d'état des serveurs et script de changement de stratégie) ;
+- mettre à jour le README et intégrer les résultats au rapport final.
+
+> **Remarque :** les tests réalisés démontrent le fonctionnement observé dans l'environnement local. Ils ne constituent pas, à eux seuls, une preuve que l'une des stratégies est globalement plus performante que les autres. Une comparaison équitable nécessite de répéter les mêmes scénarios et paramètres pour chaque stratégie.
